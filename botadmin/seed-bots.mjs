@@ -77,8 +77,14 @@ export function loadProfile(name) {
     for (const x of s.bots) if (!names.includes(x)) throw new Error(`MCP ${s.slug}: ไม่มีบอท ${x}`);
     if (!/^http:\/\/localhost:\d+\/mcp$|^https:\/\//.test(s.endpoint)) throw new Error(`MCP ${s.slug}: Rakazo รับแค่ http://localhost หรือ https`);
   }
+  for (const b of p.bots) if (b[4] && !["team", "dedicated"].includes(b[4])) throw new Error(`${b[1]}: computer ต้องเป็น team หรือ dedicated`);
   return { groups: [], mcp: [], ...p, name };
 }
+// Computer per bot: 5th element of the bot row, else the profile's "computer" default, else dedicated (original behaviour).
+// Each dedicated bot = its own Linux VM (2 CPU / 3 GB, always on); all "team" bots share one VM.
+export const computerOf = (p, b) => b[4] || p.computer || "dedicated";
+export const vmPlan = p => { const d = p.bots.filter(b => computerOf(p, b) === "dedicated").length, t = p.bots.some(b => computerOf(p, b) === "team") ? 1 : 0;
+  return { dedicated: d, shared: t, vms: d + t, ram_gb: (d + t) * 3, cpu: (d + t) * 2 }; };
 // TEAMWORK minus its demo-accounting line, plus the profile's own data rule
 const TEAMWORK_BASE = TEAMWORK.split("\n").filter(l => !l.includes("demo-accounting")).join("\n");
 export const instructionsFor = (p, own) => p.legacy ? own + TEAM + RULES + AUTO + WEB + TEAMWORK
@@ -86,7 +92,7 @@ export const instructionsFor = (p, own) => p.legacy ? own + TEAM + RULES + AUTO 
 
 const P = loadProfile(PROFILE);
 if (DRY) {
-  console.log(JSON.stringify({ profile: P.name, label: P.label, bots: P.bots.map(b => `${b[0]} / ${b[1]} — ${b[2]}`), groups: P.groups.map(([g, m]) => `${g}: ${m.join(", ")}`),
+  console.log(JSON.stringify({ profile: P.name, label: P.label, computers: vmPlan(P), bots: P.bots.map(b => `${b[0]} / ${b[1]} [${computerOf(P, b)}] — ${b[2]}`), groups: P.groups.map(([g, m]) => `${g}: ${m.join(", ")}`),
     mcp: P.mcp.map(s => `${s.slug} ${s.endpoint} → ${s.bots.join(", ")}`), sampleInstructions: instructionsFor(P, P.bots[0][3]) }, null, 1));
   process.exit(0);
 }
@@ -104,7 +110,7 @@ try {
     if (!botId.has(name)) {
       const bot = await rk("bots/create", {
         name, title, instructions: instructionsFor(P, instructions),
-        color: palette[i % PALETTE_SIZE], computerMode: "dedicated", notifyOnFinish: true,
+        color: palette[i % PALETTE_SIZE], computerMode: computerOf(P, P.bots[i]), notifyOnFinish: true,
       });
       botId.set(name, bot.id);
       made++;
@@ -138,7 +144,7 @@ try {
   boot = await rk("bootstrap");
   const seeded = boot.bots.filter(b => P.bots.some(x => x[1] === b.name));
   console.log(JSON.stringify({
-    profile: P.name, created: made, upgraded, seededBots: seeded.length, sections: boot.botSections.map(s => `${s.name}: ${seeded.filter(b => b.sectionId === s.id).length}`),
+    profile: P.name, computers: vmPlan(P), created: made, upgraded, seededBots: seeded.length, sections: boot.botSections.map(s => `${s.name}: ${seeded.filter(b => b.sectionId === s.id).length}`),
     groups: boot.groups.map(g => `${g.name} (${g.members.length})`), mcp: P.mcp.map(s => `${s.slug} → ${s.bots.length}`), totalBots: boot.bots.length,
   }, null, 1));
   await c.evaluate("App.chat.load().then(() => App.go({ type: 'home' }))");
