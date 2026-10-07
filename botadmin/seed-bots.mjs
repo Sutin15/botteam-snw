@@ -85,8 +85,16 @@ export function loadProfile(name) {
     const m = modelOf(p, p.bots.find(b => b[1] === n));
     if (m !== "local") throw new Error(`${n}: ใช้ MCP ข้อมูลจริง ${s.slug} จึงต้องเป็น model "local" (ตอนนี้ "${m}")`);
   }
+  if (p.knowledge) {
+    if (!/^[^\n#]{1,60}$/.test(p.knowledge.section || "")) throw new Error("knowledge.section ต้องเป็นชื่อหัวข้อบรรทัดเดียว");
+    p.knowledge.text = fs.readFileSync(new URL(`./${p.knowledge.file}`, import.meta.url), "utf8").trim();
+    if (/^## /m.test(p.knowledge.text)) throw new Error(`${p.knowledge.file}: ใช้หัวข้อระดับ ### ลงไป (## สงวนไว้แยกส่วนความรู้บริษัท)`);
+  }
   return { groups: [], mcp: [], ...p, name };
 }
+// Rakazo limits (packages/contracts/src/domain.ts) + the 32 KB shared-memory cap the app enforces (ui/company.js)
+const LIMITS = { name: 80, title: 500, instructions: 20000, memory: 32768 };
+const bytes = s => Buffer.byteLength(s, "utf8");
 // Brain per bot (Rakazo bot.modelProvider/modelId override, which beats the Space default set by the 🖥/⚡ switch):
 //   "local"    = pinned to Gemma on this machine, stays local even when someone presses ⚡ DeepSeek
 //   "deepseek" = pinned to DeepSeek cloud (needs the DeepSeek key connected once via the ⚡ switch)
@@ -111,9 +119,24 @@ const cloudRule = p => {
 };
 
 const P = loadProfile(PROFILE);
+for (const b of P.bots) {
+  const n = instructionsFor(P, b[3]).length;
+  if (b[1].length > LIMITS.name || b[2].length > LIMITS.title || n > LIMITS.instructions) throw new Error(`${b[1]}: ยาวเกินขีดจำกัดของ Rakazo (คำสั่ง ${n}/${LIMITS.instructions})`);
+}
+// company knowledge: one "## section" inside the account's shared MEMORY.md, replaced in place on every run
+const mergeKnowledge = (content, k) => {
+  // same shape the app writes (ui/company.js brainText): "# title" + head, then "## name\nbody" blocks separated by a blank line
+  const parts = String(content || "").split(/^## +/m), head = parts.shift().trim(), mine = `## ${k.section}\n${k.text}`;
+  const secs = parts.map(x => "## " + x.trim()).filter(x => x !== "##");
+  const i = secs.findIndex(x => x.split("\n")[0].trim() === `## ${k.section}`);
+  if (i >= 0) secs[i] = mine; else secs.push(mine);
+  return [head, ...secs].filter(Boolean).join("\n\n") + "\n";
+};
 if (DRY) {
   console.log(JSON.stringify({ profile: P.name, label: P.label, computers: vmPlan(P), bots: P.bots.map(b => `${b[0]} / ${b[1]} [${computerOf(P, b)} · ${modelOf(P, b)}] — ${b[2]}`), groups: P.groups.map(([g, m]) => `${g}: ${m.join(", ")}`),
-    mcp: P.mcp.map(s => `${s.slug} ${s.endpoint} → ${s.bots.join(", ")}`), sampleInstructions: instructionsFor(P, P.bots[0][3]) }, null, 1));
+    mcp: P.mcp.map(s => `${s.slug} ${s.endpoint} → ${s.bots.join(", ")}`),
+    knowledge: P.knowledge ? `## ${P.knowledge.section} — ${(bytes(P.knowledge.text) / 1024).toFixed(1)} KB จาก ${(LIMITS.memory / 1024)} KB ที่บัญชีใช้ร่วมกัน` : null,
+    longestInstructions: Math.max(...P.bots.map(b => instructionsFor(P, b[3]).length)), sampleInstructions: instructionsFor(P, P.bots[0][3]) }, null, 1));
   process.exit(0);
 }
 
@@ -175,11 +198,20 @@ try {
     const linked = new Set(links.filter(l => l.serverId === srv.id).map(l => l.botId));
     for (const n of s.bots) if (!linked.has(botId.get(n))) await rk("mcp/assignments/approve", { botId: botId.get(n), serverId: srv.id });
   }
+  let knowledge = null;
+  if (P.knowledge) {
+    const docs = await rk("memory/list", {}), doc = docs.find(d => !d.botId && d.path === "MEMORY.md") || docs.find(d => !d.botId);
+    if (!doc) throw new Error("ไม่พบความจำร่วม (MEMORY.md) ของบัญชีใน Rakazo");
+    const next = mergeKnowledge(doc.content, P.knowledge), botMax = Math.max(0, ...docs.filter(d => d.botId).map(d => bytes(d.content)));
+    if (bytes(next) + botMax > LIMITS.memory) throw new Error(`ความรู้บริษัทจะยาวเกิน 32 KB (${bytes(next) + botMax} ไบต์) — ย่อ ${P.knowledge.file} หรือเอาเอกสารอื่นออกในศูนย์งาน → ความรู้บริษัท`);
+    if (next !== doc.content) await rk("memory/update", { documentId: doc.id, content: next });
+    knowledge = `${P.knowledge.section}: ${(bytes(next) / 1024).toFixed(1)} KB`;
+  }
   boot = await rk("bootstrap");
   const seeded = boot.bots.filter(b => P.bots.some(x => x[1] === b.name));
   console.log(JSON.stringify({
     profile: P.name, computers: vmPlan(P), created: made, modelPins: pinned,
-    brains: Object.fromEntries(MODELS.map(m => [m, P.bots.filter(b => modelOf(P, b) === m).length])), upgraded, seededBots: seeded.length, sections: boot.botSections.map(s => `${s.name}: ${seeded.filter(b => b.sectionId === s.id).length}`),
+    knowledge, brains: Object.fromEntries(MODELS.map(m => [m, P.bots.filter(b => modelOf(P, b) === m).length])), upgraded, seededBots: seeded.length, sections: boot.botSections.map(s => `${s.name}: ${seeded.filter(b => b.sectionId === s.id).length}`),
     groups: boot.groups.map(g => `${g.name} (${g.members.length})`), mcp: P.mcp.map(s => `${s.slug} → ${s.bots.length}`), totalBots: boot.bots.length,
   }, null, 1));
   await c.evaluate("App.chat.load().then(() => App.go({ type: 'home' }))");
