@@ -1,9 +1,11 @@
 // Seed the 9 company bots (CEO, purchasing, sales, marketing, customer service, accounting, HR, warehouse, IT), each with
 // its own computer, their sections and the meeting rooms into the BotTeam account, through the running app (BotAdmin.exe --devtools-port 9223).
 // Idempotent: existing bots/sections/groups (matched by name) are reused, not duplicated.
-// usage: node seed-bots.mjs
+// usage: node seed-bots.mjs                          (default: the original 9-bot demo company + demo accounting)
+//        node seed-bots.mjs --profile mining         (team from profiles/mining.json — also: consulting, course)
+//        node seed-bots.mjs --profile mining --dry-run  (validate + print the plan, no app needed)
 import { execSync } from "node:child_process";
-import { connect } from "./tests/cdp.mjs";
+import fs from "node:fs";
 
 const RULES = `
 
@@ -53,20 +55,55 @@ const GROUPS = [
 ];
 const PALETTE_SIZE = 8;
 const ACCT_BOTS = ["CEO", "ฝ่ายจัดซื้อ", "ฝ่ายขาย", "ฝ่ายบัญชี", "ฝ่ายคลังสินค้า"]; // bots that use the demo accounting system
+export const DEMO_ACCT = { slug: "demo-accounting", name: "ระบบบัญชีสาธิต", description: "ข้อมูลสมมติ: สินค้า สต็อก ลูกค้า ใบแจ้งหนี้ รับชำระ ซื้อเข้า งบทดลอง (VAT 7%)",
+  endpoint: "http://localhost:7788/mcp", tokenPath: "/home/rakazo/rakazo/demo-acct/token" };
 
+// ---------- profile ----------
+// A profile swaps the team (bots, rooms, team blurb, extra rules, MCP servers) while keeping the shared RULES/AUTO/WEB blocks.
+const arg = name => { const i = process.argv.indexOf(name); return i < 0 ? null : process.argv[i + 1]; };
+const PROFILE = arg("--profile") || "company", DRY = process.argv.includes("--dry-run");
+export function loadProfile(name) {
+  if (name === "company") return { name, label: "บริษัทสาธิต (ต้นฉบับ)", bots: BOTS, groups: GROUPS, mcp: [{ ...DEMO_ACCT, bots: ACCT_BOTS }], legacy: true };
+  if (!/^[a-z0-9-]+$/.test(name)) throw new Error("ชื่อ profile ใช้ a-z 0-9 - เท่านั้น");
+  const p = JSON.parse(fs.readFileSync(new URL(`./profiles/${name}.json`, import.meta.url), "utf8"));
+  const names = p.bots.map(b => b[1]);
+  if (new Set(names).size !== names.length) throw new Error("ชื่อบอทซ้ำใน profile");
+  for (const [g, m] of p.groups || []) {
+    if (m.length < 2 || m.length > 6) throw new Error(`${g}: Rakazo รับห้องละ 2-6 บอท (มี ${m.length})`);
+    for (const x of m) if (!names.includes(x)) throw new Error(`${g}: ไม่มีบอท ${x}`);
+  }
+  for (const s of p.mcp || []) {
+    if (s.slug === "demo-accounting") Object.assign(s, { ...DEMO_ACCT, ...s });
+    for (const x of s.bots) if (!names.includes(x)) throw new Error(`MCP ${s.slug}: ไม่มีบอท ${x}`);
+    if (!/^http:\/\/localhost:\d+\/mcp$|^https:\/\//.test(s.endpoint)) throw new Error(`MCP ${s.slug}: Rakazo รับแค่ http://localhost หรือ https`);
+  }
+  return { groups: [], mcp: [], ...p, name };
+}
+// TEAMWORK minus its demo-accounting line, plus the profile's own data rule
+const TEAMWORK_BASE = TEAMWORK.split("\n").filter(l => !l.includes("demo-accounting")).join("\n");
+export const instructionsFor = (p, own) => p.legacy ? own + TEAM + RULES + AUTO + WEB + TEAMWORK
+  : own + "\n" + p.team + RULES + (p.rules ? "\n" + p.rules.trim() : "") + AUTO + WEB + TEAMWORK_BASE + (p.teamwork ? "\n" + p.teamwork.trim() : "");
+
+const P = loadProfile(PROFILE);
+if (DRY) {
+  console.log(JSON.stringify({ profile: P.name, label: P.label, bots: P.bots.map(b => `${b[0]} / ${b[1]} — ${b[2]}`), groups: P.groups.map(([g, m]) => `${g}: ${m.join(", ")}`),
+    mcp: P.mcp.map(s => `${s.slug} ${s.endpoint} → ${s.bots.join(", ")}`), sampleInstructions: instructionsFor(P, P.bots[0][3]) }, null, 1));
+  process.exit(0);
+}
+
+const { connect } = await import("./tests/cdp.mjs");
 const c = await connect();
 const rk = (path, input = {}) => c.evaluate(`App.call("rk", ${JSON.stringify({ path, input })})`);
 try {
-  if (new Set(BOTS.map(b => b[1])).size !== BOTS.length) throw new Error("duplicate bot names");
   let boot = await rk("bootstrap");
   const palette = await c.evaluate("App.PALETTE.map(p => p[0])");
   const botId = new Map(boot.bots.map(b => [b.name, b.id]));
   const sectionId = new Map(boot.botSections.map(s => [s.name, s.id]));
   let made = 0;
-  for (const [i, [section, name, title, instructions]] of BOTS.entries()) {
+  for (const [i, [section, name, title, instructions]] of P.bots.entries()) {
     if (!botId.has(name)) {
       const bot = await rk("bots/create", {
-        name, title, instructions: instructions + TEAM + RULES + AUTO + WEB + TEAMWORK,
+        name, title, instructions: instructionsFor(P, instructions),
         color: palette[i % PALETTE_SIZE], computerMode: "dedicated", notifyOnFinish: true,
       });
       botId.set(name, bot.id);
@@ -78,29 +115,31 @@ try {
     if (!current || current.sectionId !== sectionId.get(section)) await rk("bots/update", { botId: id, sectionId: sectionId.get(section) });
   }
   let upgraded = 0;
-  for (const b of await rk("bots/list"))
+  if (P.legacy) for (const b of await rk("bots/list")) // in-place upgrades only apply to the original demo company
     if (!BOTS.some(x => x[1] === b.name) || !b.instructions) continue;
     else if (b.instructions.includes(TEAM_5)) await rk("bots/update", { botId: b.id, instructions: b.instructions.replace(TEAM_5, TEAM_9) }), upgraded++;
     else if (b.instructions.endsWith(RULES.trim())) await rk("bots/update", { botId: b.id, instructions: b.instructions + AUTO + WEB + TEAMWORK }), upgraded++;
     else if (b.instructions.endsWith(AUTO.trim())) await rk("bots/update", { botId: b.id, instructions: b.instructions + WEB + TEAMWORK }), upgraded++;
     else if (b.instructions.endsWith(WEB.trim())) await rk("bots/update", { botId: b.id, instructions: b.instructions + TEAMWORK }), upgraded++;
   const groups = new Map(boot.groups.map(g => [g.name, g.id]));
-  for (const [name, members] of GROUPS)
+  for (const [name, members] of P.groups)
     if (!groups.has(name)) await rk("groups/create", { name, botIds: members.map(m => botId.get(m)) });
-  // demo accounting system (made-up data): MCP server on the worker's loopback, see demo-acct/server.mjs
-  let acct = (await rk("mcp/servers/list")).find(x => x.slug === "demo-accounting");
-  if (!acct) {
-    const secret = execSync("wsl -d Ubuntu-24.04 -- cat /home/rakazo/rakazo/demo-acct/token", { encoding: "utf8" }).trim(); // never printed
-    acct = await rk("mcp/servers/create", { slug: "demo-accounting", name: "ระบบบัญชีสาธิต", enabled: true, transport: "streamable_http",
-      description: "ข้อมูลสมมติ: สินค้า สต็อก ลูกค้า ใบแจ้งหนี้ รับชำระ ซื้อเข้า งบทดลอง (VAT 7%)", endpoint: "http://localhost:7788/mcp", headers: {}, secret });
+  // MCP servers on the worker's loopback (demo-acct/server.mjs, mining-mcp/server.mjs); the token is read from WSL and never printed
+  const servers = await rk("mcp/servers/list"), links = await rk("mcp/assignments/all");
+  for (const s of P.mcp) {
+    let srv = servers.find(x => x.slug === s.slug);
+    if (!srv) {
+      const secret = execSync(`wsl -d Ubuntu-24.04 -- cat ${s.tokenPath}`, { encoding: "utf8" }).trim();
+      srv = await rk("mcp/servers/create", { slug: s.slug, name: s.name, enabled: true, transport: "streamable_http", description: s.description, endpoint: s.endpoint, headers: {}, secret });
+    }
+    const linked = new Set(links.filter(l => l.serverId === srv.id).map(l => l.botId));
+    for (const n of s.bots) if (!linked.has(botId.get(n))) await rk("mcp/assignments/approve", { botId: botId.get(n), serverId: srv.id });
   }
-  const linked = new Set((await rk("mcp/assignments/all")).filter(l => l.serverId === acct.id).map(l => l.botId));
-  for (const n of ACCT_BOTS) if (!linked.has(botId.get(n))) await rk("mcp/assignments/approve", { botId: botId.get(n), serverId: acct.id });
   boot = await rk("bootstrap");
-  const seeded = boot.bots.filter(b => BOTS.some(x => x[1] === b.name));
+  const seeded = boot.bots.filter(b => P.bots.some(x => x[1] === b.name));
   console.log(JSON.stringify({
-    created: made, upgraded, seededBots: seeded.length, sections: boot.botSections.map(s => `${s.name}: ${seeded.filter(b => b.sectionId === s.id).length}`),
-    groups: boot.groups.map(g => `${g.name} (${g.members.length})`), accounting: ACCT_BOTS.length, totalBots: boot.bots.length,
+    profile: P.name, created: made, upgraded, seededBots: seeded.length, sections: boot.botSections.map(s => `${s.name}: ${seeded.filter(b => b.sectionId === s.id).length}`),
+    groups: boot.groups.map(g => `${g.name} (${g.members.length})`), mcp: P.mcp.map(s => `${s.slug} → ${s.bots.length}`), totalBots: boot.bots.length,
   }, null, 1));
   await c.evaluate("App.chat.load().then(() => App.go({ type: 'home' }))");
 } finally { c.close(); }

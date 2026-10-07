@@ -19,14 +19,17 @@ case "${1:-status}" in
          # demo-accounting lives in the worker's network namespace: a recreated worker leaves it on a dead one
          w=$(docker inspect -f '{{.Id}}' rakazo-worker-1 2>/dev/null)
          [ -z "$w" ] || [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' rakazo-demo-accounting-1 2>/dev/null)" = "container:$w" ] ||
-           dc up -d --no-deps --force-recreate --pull never demo-accounting; true ;;
+           dc up -d --no-deps --force-recreate --pull never demo-accounting
+         # mining-data MCP (profile mining): same sidecar pattern, only if installed (~/rakazo/mining-mcp/token exists)
+         [ -z "$w" ] || [ ! -f mining-mcp/token ] || [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' rakazo-mining-data-1 2>/dev/null)" = "container:$w" ] ||
+           dc up -d --no-deps --force-recreate --pull never mining-data; true ;;
   stop) dc stop ;;
   logs) dc logs --no-color --tail 200 "${2:-api}" ;;
   # published-image install has no scripts/backup.sh: same content (pg_dump + data volume) to D:localaiackups
   backup) d=/mnt/d/localai/backups/rakazo-$(date +%Y%m%d-%H%M%S); mkdir -p "$d" &&
           docker exec rakazo-postgres-1 pg_dump -U rakazo -d rakazo -Fc > "$d/rakazo.dump" &&
           docker run --rm -v rakazo_appdata:/data:ro -v "$d":/out busybox:1 tar czf /out/appdata.tgz -C /data . &&
-          cp docker-compose.override.yml "$d/" && tar czf "$d/hotfix.tgz" hotfix computer-th demo-acct && echo "OK $d" && ls -la "$d" ||
+          cp docker-compose.override.yml "$d/" && tar czf "$d/hotfix.tgz" hotfix computer-th demo-acct $(ls -d mining-mcp 2>/dev/null) && echo "OK $d" && ls -la "$d" ||
           { echo "ERR backup failed: discard $d"; exit 1; } ;;
   *) echo "usage: rakazo.sh status|start|stop|logs [service]|backup"; exit 2 ;;
 esac

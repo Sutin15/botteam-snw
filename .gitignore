@@ -7,6 +7,8 @@
 owner.json
 botadmin/demo-acct/token
 botadmin/demo-acct/data.json*
+botadmin/mining-mcp/token
+botadmin/mining-mcp/data.json*
 
 # ผล build / dependency
 botadmin/bin/

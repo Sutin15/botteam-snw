@@ -40,3 +40,14 @@ services:
       - ./demo-acct:/demo
     restart: unless-stopped
     depends_on: [worker]
+  # Mining data MCP (profile "mining"): REAL project data recorded by the team (starts empty). Same sidecar pattern as
+  # demo-accounting, binds 127.0.0.1:7789. data.json lives in ./mining-mcp and is included in rakazo.sh backup.
+  mining-data:
+    image: ghcr.io/elie222/rakazo/app:v0.1.6
+    network_mode: "service:worker"
+    entrypoint: ["node", "/mining/server.mjs"]
+    user: "1000:1001"
+    volumes:
+      - ./mining-mcp:/mining
+    restart: unless-stopped
+    depends_on: [worker]
