@@ -78,8 +78,23 @@ export function loadProfile(name) {
     if (!/^http:\/\/localhost:\d+\/mcp$|^https:\/\//.test(s.endpoint)) throw new Error(`MCP ${s.slug}: Rakazo รับแค่ http://localhost หรือ https`);
   }
   for (const b of p.bots) if (b[4] && !["team", "dedicated"].includes(b[4])) throw new Error(`${b[1]}: computer ต้องเป็น team หรือ dedicated`);
+  for (const b of p.bots) if (b[5] && !MODELS.includes(b[5])) throw new Error(`${b[1]}: model ต้องเป็น ${MODELS.join(" / ")}`);
+  if (p.model && !MODELS.includes(p.model)) throw new Error(`model ต้องเป็น ${MODELS.join(" / ")}`);
+  // a bot that may run on the cloud must never hold a private-data MCP (its tool results would leave the machine)
+  for (const s of p.mcp || []) if (s.private) for (const n of s.bots) {
+    const m = modelOf(p, p.bots.find(b => b[1] === n));
+    if (m !== "local") throw new Error(`${n}: ใช้ MCP ข้อมูลจริง ${s.slug} จึงต้องเป็น model "local" (ตอนนี้ "${m}")`);
+  }
   return { groups: [], mcp: [], ...p, name };
 }
+// Brain per bot (Rakazo bot.modelProvider/modelId override, which beats the Space default set by the 🖥/⚡ switch):
+//   "local"    = pinned to Gemma on this machine, stays local even when someone presses ⚡ DeepSeek
+//   "deepseek" = pinned to DeepSeek cloud (needs the DeepSeek key connected once via the ⚡ switch)
+//   "default"  = no pin, follows the 🖥/⚡ switch (original behaviour)
+// 6th element of the bot row, else the profile's "model", else "default".
+export const MODELS = ["local", "deepseek", "default"];
+export const modelOf = (p, b) => b[5] || p.model || "default";
+const DEEPSEEK_MODEL = "deepseek-v4-flash-vision-exp"; // same id as RakazoClient.cs DeepSeekModel
 // Computer per bot: 5th element of the bot row, else the profile's "computer" default, else dedicated (original behaviour).
 // Each dedicated bot = its own Linux VM (2 CPU / 3 GB, always on); all "team" bots share one VM.
 export const computerOf = (p, b) => b[4] || p.computer || "dedicated";
@@ -88,11 +103,16 @@ export const vmPlan = p => { const d = p.bots.filter(b => computerOf(p, b) === "
 // TEAMWORK minus its demo-accounting line, plus the profile's own data rule
 const TEAMWORK_BASE = TEAMWORK.split("\n").filter(l => !l.includes("demo-accounting")).join("\n");
 export const instructionsFor = (p, own) => p.legacy ? own + TEAM + RULES + AUTO + WEB + TEAMWORK
-  : own + "\n" + p.team + RULES + (p.rules ? "\n" + p.rules.trim() : "") + AUTO + WEB + TEAMWORK_BASE + (p.teamwork ? "\n" + p.teamwork.trim() : "");
+  : own + "\n" + p.team + RULES + (p.rules ? "\n" + p.rules.trim() : "") + AUTO + WEB + TEAMWORK_BASE + (p.teamwork ? "\n" + p.teamwork.trim() : "") + cloudRule(p);
+// hybrid brains: tell every bot which teammates run on the cloud, so project data is never handed to them
+const cloudRule = p => {
+  const cloud = p.bots.filter(b => modelOf(p, b) === "deepseek").map(b => b[1]);
+  return cloud.length ? `\n- บอทที่ใช้สมองบนคลาวด์ (DeepSeek): ${cloud.join(", ")} — ส่งต่อได้เฉพาะงานข้อมูลสาธารณะ (ราคาตลาด ค้นเว็บ ร่างเอกสารทั่วไป) ห้ามส่งข้อมูลโครงการ ลูกค้า ตัวเลขภายใน หรือไฟล์แนบให้บอทเหล่านี้` : "";
+};
 
 const P = loadProfile(PROFILE);
 if (DRY) {
-  console.log(JSON.stringify({ profile: P.name, label: P.label, computers: vmPlan(P), bots: P.bots.map(b => `${b[0]} / ${b[1]} [${computerOf(P, b)}] — ${b[2]}`), groups: P.groups.map(([g, m]) => `${g}: ${m.join(", ")}`),
+  console.log(JSON.stringify({ profile: P.name, label: P.label, computers: vmPlan(P), bots: P.bots.map(b => `${b[0]} / ${b[1]} [${computerOf(P, b)} · ${modelOf(P, b)}] — ${b[2]}`), groups: P.groups.map(([g, m]) => `${g}: ${m.join(", ")}`),
     mcp: P.mcp.map(s => `${s.slug} ${s.endpoint} → ${s.bots.join(", ")}`), sampleInstructions: instructionsFor(P, P.bots[0][3]) }, null, 1));
   process.exit(0);
 }
@@ -120,6 +140,20 @@ try {
     const current = boot.bots.find(b => b.id === id);
     if (!current || current.sectionId !== sectionId.get(section)) await rk("bots/update", { botId: id, sectionId: sectionId.get(section) });
   }
+  // per-bot brain pins (also re-applied to bots that already exist, so a profile change takes effect on the next run)
+  const creds = await rk("models/credentials"), credOf = prov => creds.find(x => x.provider === prov);
+  const pinOf = m => m === "local" ? { modelProvider: "openai-compatible", modelId: credOf("openai-compatible")?.modelId }
+    : m === "deepseek" ? { modelProvider: "deepseek", modelId: DEEPSEEK_MODEL } : { modelProvider: null, modelId: null };
+  let pinned = 0;
+  const current = new Map((await rk("bots/list")).map(b => [b.name, b]));
+  for (const b of P.bots) {
+    const m = modelOf(P, b), want = pinOf(m), have = current.get(b[1]);
+    if (m === "local" && !want.modelId) throw new Error("ยังไม่ได้เชื่อม Local model ใน Rakazo (เปิดแอป BotTeam ให้เชื่อมก่อน)");
+    if (m === "deepseek" && !credOf("deepseek")) throw new Error(`${b[1]}: ต้องกด ⚡ DeepSeek ในแอปครั้งหนึ่งเพื่อเชื่อมคีย์ก่อน`);
+    if (have && (have.modelProvider ?? null) === want.modelProvider && (have.modelId ?? null) === want.modelId) continue;
+    await rk("bots/update", { botId: botId.get(b[1]), ...want });
+    pinned++;
+  }
   let upgraded = 0;
   if (P.legacy) for (const b of await rk("bots/list")) // in-place upgrades only apply to the original demo company
     if (!BOTS.some(x => x[1] === b.name) || !b.instructions) continue;
@@ -144,7 +178,8 @@ try {
   boot = await rk("bootstrap");
   const seeded = boot.bots.filter(b => P.bots.some(x => x[1] === b.name));
   console.log(JSON.stringify({
-    profile: P.name, computers: vmPlan(P), created: made, upgraded, seededBots: seeded.length, sections: boot.botSections.map(s => `${s.name}: ${seeded.filter(b => b.sectionId === s.id).length}`),
+    profile: P.name, computers: vmPlan(P), created: made, modelPins: pinned,
+    brains: Object.fromEntries(MODELS.map(m => [m, P.bots.filter(b => modelOf(P, b) === m).length])), upgraded, seededBots: seeded.length, sections: boot.botSections.map(s => `${s.name}: ${seeded.filter(b => b.sectionId === s.id).length}`),
     groups: boot.groups.map(g => `${g.name} (${g.members.length})`), mcp: P.mcp.map(s => `${s.slug} → ${s.bots.length}`), totalBots: boot.bots.length,
   }, null, 1));
   await c.evaluate("App.chat.load().then(() => App.go({ type: 'home' }))");
