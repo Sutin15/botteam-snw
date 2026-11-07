@@ -6,6 +6,7 @@
 //        node seed-bots.mjs --profile mining --dry-run  (validate + print the plan, no app needed)
 import { execSync } from "node:child_process";
 import fs from "node:fs";
+import { checkHandoffs, handoffRule, withHandoffs } from "./handoffs.mjs";
 
 const RULES = `
 
@@ -85,8 +86,9 @@ export function loadProfile(name) {
     const m = modelOf(p, p.bots.find(b => b[1] === n));
     if (m !== "local") throw new Error(`${n}: ใช้ MCP ข้อมูลจริง ${s.slug} จึงต้องเป็น model "local" (ตอนนี้ "${m}")`);
   }
+  checkHandoffs(p.handoffs, names);
   if (p.knowledge) {
-    if (!/^[^\n#]{1,60}$/.test(p.knowledge.section || "")) throw new Error("knowledge.section ต้องเป็นชื่อหัวข้อบรรทัดเดียว");
+    if (!/^[^\n#]{1,60}$/.test(p.knowledge.section || ""))throw new Error("knowledge.section ต้องเป็นชื่อหัวข้อบรรทัดเดียว");
     p.knowledge.text = fs.readFileSync(new URL(`./${p.knowledge.file}`, import.meta.url), "utf8").trim();
     if (/^## /m.test(p.knowledge.text)) throw new Error(`${p.knowledge.file}: ใช้หัวข้อระดับ ### ลงไป (## สงวนไว้แยกส่วนความรู้บริษัท)`);
   }
@@ -110,8 +112,9 @@ export const vmPlan = p => { const d = p.bots.filter(b => computerOf(p, b) === "
   return { dedicated: d, shared: t, vms: d + t, ram_gb: (d + t) * 3, cpu: (d + t) * 2 }; };
 // TEAMWORK minus its demo-accounting line, plus the profile's own data rule
 const TEAMWORK_BASE = TEAMWORK.split("\n").filter(l => !l.includes("demo-accounting")).join("\n");
-export const instructionsFor = (p, own) => p.legacy ? own + TEAM + RULES + AUTO + WEB + TEAMWORK
-  : own + "\n" + p.team + RULES + (p.rules ? "\n" + p.rules.trim() : "") + AUTO + WEB + TEAMWORK_BASE + (p.teamwork ? "\n" + p.teamwork.trim() : "") + cloudRule(p);
+// the handoff section always comes last, so a later run can swap it in place on bots that already exist
+export const instructionsFor = (p, own, name) => p.legacy ? own + TEAM + RULES + AUTO + WEB + TEAMWORK
+  : own + "\n" + p.team + RULES + (p.rules ? "\n" + p.rules.trim() : "") + AUTO + WEB + TEAMWORK_BASE + (p.teamwork ? "\n" + p.teamwork.trim() : "") + cloudRule(p) + handoffRule(p, name);
 // hybrid brains: tell every bot which teammates run on the cloud, so project data is never handed to them
 const cloudRule = p => {
   const cloud = p.bots.filter(b => modelOf(p, b) === "deepseek").map(b => b[1]);
@@ -120,7 +123,7 @@ const cloudRule = p => {
 
 const P = loadProfile(PROFILE);
 for (const b of P.bots) {
-  const n = instructionsFor(P, b[3]).length;
+  const n = instructionsFor(P, b[3], b[1]).length;
   if (b[1].length > LIMITS.name || b[2].length > LIMITS.title || n > LIMITS.instructions) throw new Error(`${b[1]}: ยาวเกินขีดจำกัดของ Rakazo (คำสั่ง ${n}/${LIMITS.instructions})`);
 }
 // company knowledge: one "## section" inside the account's shared MEMORY.md, replaced in place on every run
@@ -136,7 +139,8 @@ if (DRY) {
   console.log(JSON.stringify({ profile: P.name, label: P.label, computers: vmPlan(P), bots: P.bots.map(b => `${b[0]} / ${b[1]} [${computerOf(P, b)} · ${modelOf(P, b)}] — ${b[2]}`), groups: P.groups.map(([g, m]) => `${g}: ${m.join(", ")}`),
     mcp: P.mcp.map(s => `${s.slug} ${s.endpoint} → ${s.bots.join(", ")}`),
     knowledge: P.knowledge ? `## ${P.knowledge.section} — ${(bytes(P.knowledge.text) / 1024).toFixed(1)} KB จาก ${(LIMITS.memory / 1024)} KB ที่บัญชีใช้ร่วมกัน` : null,
-    longestInstructions: Math.max(...P.bots.map(b => instructionsFor(P, b[3]).length)), sampleInstructions: instructionsFor(P, P.bots[0][3]) }, null, 1));
+    handoffs: (P.handoffs || []).map(f => `${f.flow}${f.maxReturns ? ` (ตีกลับ ≤${f.maxReturns})` : ""}: ` + f.steps.map(s => `${s.from} → ${s.to} [${s.hands}]`).join(" · ")),
+    longestInstructions: Math.max(...P.bots.map(b => instructionsFor(P, b[3], b[1]).length)), sampleInstructions: instructionsFor(P, P.bots[0][3], P.bots[0][1]) }, null, 1));
   process.exit(0);
 }
 
@@ -152,7 +156,7 @@ try {
   for (const [i, [section, name, title, instructions]] of P.bots.entries()) {
     if (!botId.has(name)) {
       const bot = await rk("bots/create", {
-        name, title, instructions: instructionsFor(P, instructions),
+        name, title, instructions: instructionsFor(P, instructions, name),
         color: palette[i % PALETTE_SIZE], computerMode: computerOf(P, P.bots[i]), notifyOnFinish: true,
       });
       botId.set(name, bot.id);
@@ -178,6 +182,12 @@ try {
     pinned++;
   }
   let upgraded = 0;
+  // handoff contracts on bots that already exist: swap only the trailing "# การส่งงานต่อ" section, keep any hand edits above it
+  if (!P.legacy) for (const b of await rk("bots/list")) {
+    if (!P.bots.some(x => x[1] === b.name) || !b.instructions) continue;
+    const next = withHandoffs(P, b.instructions, b.name);
+    if (next !== b.instructions) await rk("bots/update", { botId: b.id, instructions: next }), upgraded++;
+  }
   if (P.legacy) for (const b of await rk("bots/list")) // in-place upgrades only apply to the original demo company
     if (!BOTS.some(x => x[1] === b.name) || !b.instructions) continue;
     else if (b.instructions.includes(TEAM_5)) await rk("bots/update", { botId: b.id, instructions: b.instructions.replace(TEAM_5, TEAM_9) }), upgraded++;
